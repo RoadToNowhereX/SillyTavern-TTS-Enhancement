@@ -217,10 +217,12 @@ export class MiMoTtsProvider {
                 「由扩展过滤正则」，否则换行会在更早的清洗里被折叠，本条自动回退为按句切分。
             </small>
 
-            <label for="mimo_pipeline_first">首批字数 / 后续每批上限（仅默认方式）：</label>
-            <div class="flex-container alignItemsCenter flexGap5">
-                <input id="mimo_pipeline_first" type="number" class="text_pole" min="5" max="200" step="5"/>
-                <input id="mimo_pipeline_max" type="number" class="text_pole" min="20" max="500" step="10"/>
+            <div id="mimo_pipeline_limits">
+                <label for="mimo_pipeline_first">首批字数 / 后续每批上限（仅默认方式）：</label>
+                <div class="flex-container alignItemsCenter flexGap5">
+                    <input id="mimo_pipeline_first" type="number" class="text_pole" min="5" max="200" step="5"/>
+                    <input id="mimo_pipeline_max" type="number" class="text_pole" min="20" max="500" step="10"/>
+                </div>
             </div>
 
             <small class="mimo-hint">
@@ -260,6 +262,7 @@ export class MiMoTtsProvider {
 
         $('#mimo_pipeline').prop('checked', !!this.settings.pipeline);
         $('#mimo_pipeline_mode').val(this.settings.pipeline_mode);
+        this.syncPipelineLimitsVisibility();
         $('#mimo_filter_regex').val(this.settings.filter_regex);
         $('#mimo_pipeline_first').val(this.settings.pipeline_first);
         $('#mimo_pipeline_max').val(this.settings.pipeline_max);
@@ -289,9 +292,16 @@ export class MiMoTtsProvider {
         console.info(`[${PROVIDER_NAME}] v${VERSION} 设置已加载`);
     }
 
+    /** 按段模式一段一批，不参与首批/上限计算，隐藏避免误解 */
+    syncPipelineLimitsVisibility() {
+        const isParagraph = String($('#mimo_pipeline_mode').val() || '') === 'paragraph';
+        $('#mimo_pipeline_limits').toggle(!isParagraph);
+    }
+
     onSettingsChange() {
         this.settings.pipeline = !!$('#mimo_pipeline').prop('checked');
         this.settings.pipeline_mode = String($('#mimo_pipeline_mode').val() || '') === 'paragraph' ? 'paragraph' : 'default';
+        this.syncPipelineLimitsVisibility();
         const pf = Number($('#mimo_pipeline_first').val());
         this.settings.pipeline_first = Number.isFinite(pf) ? Math.min(200, Math.max(5, pf)) : 20;
         const pm = Number($('#mimo_pipeline_max').val());
