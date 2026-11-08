@@ -5,7 +5,7 @@
     "optional": [],
     "js": "index.js",
     "author": "ymf2317-tech",
-    "version": "2.0.2",
+    "version": "2.0.3",
     "homePage": "https://github.com/RoadToNowhereX/SillyTavern-TTS-Enhancement",
     "hooks": {
         "activate": "init"

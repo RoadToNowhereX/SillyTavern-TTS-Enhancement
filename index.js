@@ -14,7 +14,7 @@
 import { getRequestHeaders, eventSource, event_types } from '../../../../script.js';
 import { registerTtsProvider, saveTtsProviderSettings } from '../../tts/index.js';
 
-const VERSION = '2.0.2';
+const VERSION = '2.0.3';
 const PROVIDER_NAME = 'OpenAI Compatible Enhancement';
 const ST_RELAY_ROUTE = '/api/openai/custom/generate-voice';
 const MODEL_PRESET = 'tts-1';
@@ -163,6 +163,10 @@ export class MiMoTtsProvider {
         filter_regex: '',     // 由扩展过滤正则（与酒馆「应用正则过滤」互斥，保留换行）
         pipeline_first: 20,   // 首批字数（越小首音越快）
         pipeline_max: 120,    // 后续每批上限（越大卡顿越少）
+        // 段尾停顿：切分完成后，在每一段末尾追加用户填写的停顿符（如 [pause]）。
+        // 开关关着、或文本框留空时都不追加。
+        paragraph_pause: false,
+        pause_marker: '',
         style: '',
         voices: ['A'],
         // 中转地址留空，由用户自己填（不再写死某台机器的内网地址）
@@ -225,6 +229,19 @@ export class MiMoTtsProvider {
                 </div>
             </div>
 
+            <label class="checkbox_label">
+                <input type="checkbox" id="mimo_paragraph_pause"/>
+                <span>段尾停顿（切分后每段末尾追加停顿符）</span>
+            </label>
+            <div id="mimo_pause_marker_wrap">
+                <label for="mimo_pause_marker">停顿符（留空则不添加）：</label>
+                <input id="mimo_pause_marker" type="text" class="text_pole" maxlength="100"
+                    placeholder="例如：[pause] 或 (pause)"/>
+            </div>
+            <small>
+                停顿符会原样加在每一批已切分文本的末尾，由供应商自行解释；需要「分段流水线」处于开启状态。
+            </small>
+
             <small class="mimo-hint">
                 所有合成请求都由酒馆服务器转发到上面的「中转地址」，浏览器不再直连供应商。<br>
                 音色与角色映射沿用酒馆的 Voice Map，无需在此重复设置。
@@ -259,10 +276,17 @@ export class MiMoTtsProvider {
         if (typeof this.settings.filter_regex !== 'string') {
             this.settings.filter_regex = '';
         }
+        this.settings.paragraph_pause = !!this.settings.paragraph_pause;
+        if (typeof this.settings.pause_marker !== 'string') {
+            this.settings.pause_marker = '';
+        }
 
         $('#mimo_pipeline').prop('checked', !!this.settings.pipeline);
         $('#mimo_pipeline_mode').val(this.settings.pipeline_mode);
         this.syncPipelineLimitsVisibility();
+        $('#mimo_paragraph_pause').prop('checked', this.settings.paragraph_pause);
+        $('#mimo_pause_marker').val(this.settings.pause_marker);
+        this.syncPauseMarkerVisibility();
         $('#mimo_filter_regex').val(this.settings.filter_regex);
         $('#mimo_pipeline_first').val(this.settings.pipeline_first);
         $('#mimo_pipeline_max').val(this.settings.pipeline_max);
@@ -280,6 +304,8 @@ export class MiMoTtsProvider {
         bind('#mimo_pipeline_mode', () => this.onSettingsChange());
         bind('#mimo_pipeline_first', () => this.onSettingsChange());
         bind('#mimo_pipeline_max', () => this.onSettingsChange());
+        bind('#mimo_paragraph_pause', () => this.onSettingsChange());
+        bind('#mimo_pause_marker', () => this.onSettingsChange());
         bind('#mimo_api_key', () => this.onSettingsChange());
         bind('#mimo_model', () => this.onSettingsChange());
         bind('#mimo_voices', () => this.onSettingsChange());
@@ -298,6 +324,12 @@ export class MiMoTtsProvider {
         $('#mimo_pipeline_limits').toggle(!isParagraph);
     }
 
+    /** 段尾停顿开关关着时隐藏自定义停顿符输入框 */
+    syncPauseMarkerVisibility() {
+        const enabled = !!$('#mimo_paragraph_pause').prop('checked');
+        $('#mimo_pause_marker_wrap').toggle(enabled);
+    }
+
     onSettingsChange() {
         this.settings.pipeline = !!$('#mimo_pipeline').prop('checked');
         this.settings.pipeline_mode = String($('#mimo_pipeline_mode').val() || '') === 'paragraph' ? 'paragraph' : 'default';
@@ -306,6 +338,9 @@ export class MiMoTtsProvider {
         this.settings.pipeline_first = Number.isFinite(pf) ? Math.min(200, Math.max(5, pf)) : 20;
         const pm = Number($('#mimo_pipeline_max').val());
         this.settings.pipeline_max = Number.isFinite(pm) ? Math.min(500, Math.max(20, pm)) : 120;
+        this.settings.paragraph_pause = !!$('#mimo_paragraph_pause').prop('checked');
+        this.settings.pause_marker = String($('#mimo_pause_marker').val() || '');
+        this.syncPauseMarkerVisibility();
         this.settings.api_key = String($('#mimo_api_key').val() || '');
         this.settings.model = String($('#mimo_model').val() || MODEL_PRESET);
         this.settings.voices = String($('#mimo_voices').val() || '')
@@ -489,12 +524,28 @@ export class MiMoTtsProvider {
     }
 
     /**
+     * 段尾停顿：切分完成后，在每段末尾追加用户填写的停顿符。
+     * 开关关着，或停顿符留空（仅空白）时原样返回。
+     */
+    applyPauseMarkers(chunks) {
+        const enabled = !!this.settings?.paragraph_pause;
+        const marker = String(this.settings?.pause_marker ?? '');
+        if (!enabled || !marker.trim()) {
+            return chunks;
+        }
+        return chunks.map(chunk => (chunk.trim().length > 0 ? `${chunk}${marker}` : chunk));
+    }
+
+    /**
      * 整段播放：逐批请求、边到边抛。
      * 每批都是一整段完整音频（内容不切碎），所以不会出现"突突突"；
      * 批与批之间会有一次换源开销（0.3~0.5s），落在句子边界上。
      */
     async *wholeTts(text, voiceId, signal) {
-        const chunks = this.settings.pipeline ? this.splitIntoChunks(text) : [text];
+        // 先切分，再给每段补停顿符（仅流水线开启时才有"段"）
+        const chunks = this.settings.pipeline
+            ? this.applyPauseMarkers(this.splitIntoChunks(text))
+            : [text];
 
         for (let i = 0; i < chunks.length; i++) {
             if (signal?.aborted) {
