@@ -14,7 +14,7 @@
 import { getRequestHeaders, eventSource, event_types } from '../../../../script.js';
 import { registerTtsProvider, saveTtsProviderSettings } from '../../tts/index.js';
 
-const VERSION = '2.0.0';
+const VERSION = '2.0.1';
 const PROVIDER_NAME = 'OpenAI Compatible Enhancement';
 const ST_RELAY_ROUTE = '/api/openai/custom/generate-voice';
 const MODEL_PRESET = 'mimo-v2.5-tts';
