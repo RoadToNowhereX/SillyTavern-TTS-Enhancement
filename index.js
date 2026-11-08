@@ -1,40 +1,29 @@
 /**
- * MiMo TTS — 小米 MiMo 语音合成供应商（SillyTavern 第三方扩展）
- * v2.0.0 合并版：公开版（0.2.0）+ 自用完整版（1.4.x）
+ * OpenAI Compatible Enhancement — SillyTavern 第三方 TTS 供应商扩展
  *
- * 关于音频质量的要点（重要，勿轻易改动）：
- *   MiMo 的 /v1/chat/completions 在 stream:true 时，**每个 SSE 数据块都会自带一个
- *   MP3 元数据帧（Xing 头帧，以 "Xing" 标记）**。把多块拼起来就等于在音频中间插入
- *   了几十个空帧，播放时会每 ~0.3 秒"突"一下。
- *   因此：整段播放必须走 stream:false（返回单个完整 MP3，仅含 1 个 Xing 帧）。
- *   分块播放则改用 pcm16（无帧结构、可任意切割）并自行封装 WAV，避开该问题。
+ * 所有合成都经酒馆服务器中转（relay），由服务器请求 OpenAI 兼容的
+ * /v1/audio/speech 接口，浏览器不再直连供应商。
  *
- * 播放方式（play_mode）：
- *   whole   整段播放（默认，推荐）—— 非流式接口拿完整音频，只播一次，完全连贯。
- *   chunked 分块流式 —— 首音快，但酒馆每块都要"换音源+等 canplay"（0.3~0.5s），
- *                        块间必然有间断，仅作尝鲜。
+ * 播放方式：
+ *   整段播放（推荐）—— 中转接口返回单个完整音频，只播一次，完全连贯。
+ *   分段流水线 —— 长文本自动按句切分、逐批请求、边到边播，首音更快。
  *
- * 传输方式（mode）：direct = 浏览器直连新加坡；relay = 经服务器本地中转。
- *
- * 安装位置：data/<user>/extensions/mimo-tts/（在 git 之外，升级酒馆不受影响）
+ * 安装位置：data/<user>/extensions/（在 git 之外，升级酒馆不受影响）
  */
 
 import { getRequestHeaders, eventSource, event_types } from '../../../../script.js';
 import { registerTtsProvider, saveTtsProviderSettings } from '../../tts/index.js';
 
 const VERSION = '2.0.0';
-const PROVIDER_NAME = 'MiMo';
-const MIMO_ENDPOINT = 'https://api.xiaomimimo.com/v1/chat/completions';
+const PROVIDER_NAME = 'OpenAI Compatible Enhancement';
 const ST_RELAY_ROUTE = '/api/openai/custom/generate-voice';
 const MODEL_PRESET = 'mimo-v2.5-tts';
-const BYTES_PER_SECOND = 48000; // pcm16 24kHz/16bit 单声道 = 48000 B/s
-const PCM_SAMPLE_RATE = 24000;
-const PREVIEW_TEXT = '你好，我是小米 MiMo 的语音合成，这是一段试听。';
+const PREVIEW_TEXT = '你好，我是语音合成，这是一段试听。';
 
 // ----------------------------------------------------------------------
 //  在途请求的取消（重要）
 //  酒馆的 resetTtsPlayback() 只会清空队列，**不会通知供应商取消已发出的请求**。
-//  而 MiMo 整段合成要 5~10 秒，若不取消，"过期"的音频会在用户切换消息之后才
+//  而整段合成要等供应商返回完整音频，若不取消，"过期"的音频会在用户切换消息之后才
 //  落地播放 —— 表现为：点了另一条没反应 / 两条一起读 / 播起来没完。
 //  这里采用「新的覆盖旧的」策略：新请求一来就中止上一个。
 // ----------------------------------------------------------------------
@@ -48,7 +37,7 @@ function isAbortError(error) {
 
 /**
  * 判断清洗后的文本是否「有可朗读的内容」。
- * MiMo 对空串 / 纯换行 / 纯标点会直接返回 HTTP 500（实测），必须提前拦下来，
+ * 中转接口对空串 / 纯换行 / 纯标点可能直接返回 HTTP 500，必须提前拦下来，
  * 否则用户看到的就是一坨 {"error":{"code":"500"...}}。
  */
 function hasSpeakableText(text) {
@@ -82,67 +71,13 @@ function abortActiveGeneration() {
 function toast(kind, message) {
     try {
         if (typeof toastr !== 'undefined' && typeof toastr[kind] === 'function') {
-            toastr[kind](message, 'MiMo TTS', { timeOut: 3500 });
+            toastr[kind](message, PROVIDER_NAME, { timeOut: 3500 });
             return;
         }
     } catch {
         /* ignore */
     }
-    console.info(`[MiMo TTS] ${message}`);
-}
-
-/** base64 → Uint8Array */
-function base64ToBytes(b64) {
-    const bin = atob(String(b64).replace(/\s+/g, ''));
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) {
-        out[i] = bin.charCodeAt(i);
-    }
-    return out;
-}
-
-/** 把若干 Uint8Array 拼成一个 */
-function concatBytes(list) {
-    let total = 0;
-    for (const c of list) {
-        total += c.length;
-    }
-    const out = new Uint8Array(total);
-    let off = 0;
-    for (const c of list) {
-        out.set(c, off);
-        off += c.length;
-    }
-    return out;
-}
-
-/** 给裸 PCM16 加上 WAV 头（24kHz / 16bit / 单声道） */
-function pcm16ToWav(pcm) {
-    const header = new ArrayBuffer(44);
-    const view = new DataView(header);
-    const writeStr = (off, s) => {
-        for (let i = 0; i < s.length; i++) {
-            view.setUint8(off + i, s.charCodeAt(i));
-        }
-    };
-    writeStr(0, 'RIFF');
-    view.setUint32(4, 36 + pcm.length, true);
-    writeStr(8, 'WAVE');
-    writeStr(12, 'fmt ');
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true); // PCM
-    view.setUint16(22, 1, true); // 单声道
-    view.setUint32(24, PCM_SAMPLE_RATE, true);
-    view.setUint32(28, PCM_SAMPLE_RATE * 2, true);
-    view.setUint16(32, 2, true);
-    view.setUint16(34, 16, true);
-    writeStr(36, 'data');
-    view.setUint32(40, pcm.length, true);
-
-    const out = new Uint8Array(44 + pcm.length);
-    out.set(new Uint8Array(header), 0);
-    out.set(pcm, 44);
-    return out;
+    console.info(`[${PROVIDER_NAME}] ${message}`);
 }
 
 export class MiMoTtsProvider {
@@ -154,13 +89,8 @@ export class MiMoTtsProvider {
 
     defaultSettings = {
         voiceMap: {},
-        mode: 'direct',
         api_key: '',
         model: MODEL_PRESET,
-        // whole = 整段播放（干净、连贯）；chunked = 分块流式（首音快但有间断）
-        play_mode: 'whole',
-        // 仅 chunked 模式有效：每块攒够多久才抛给播放器
-        chunk_seconds: 8,
         // 分段流水线：长文本自动按句切分、逐批请求、边到边播（首音更快）。
         // 用于替代酒馆的「按段朗读」——后者会让清洗变为逐行，跨行正则失效。
         pipeline: true,
@@ -175,20 +105,22 @@ export class MiMoTtsProvider {
     get settingsHtml() {
         return `
         <div class="mimo-tts-settings">
-            <label for="mimo_play_mode">播放方式：</label>
-            <select id="mimo_play_mode" class="text_pole">
-                <option value="whole">整段播放（推荐：声音完整连贯，等待稍长）</option>
-                <option value="chunked">分块流式（首音快，但会有间断）</option>
-            </select>
-            <small>
-                <b>推荐用"整段播放"。</b>酒馆全程只用一个播放器，每换一次音频源就要重新解码等待
-                0.3~0.5 秒，所以只要分成多块就必然一顿一顿，"分块流式"无法做到连贯。<br>
-                整段播放走非流式接口拿完整音频，只播一次，因此完全顺滑；
-                代价是首音要等 MiMo 把整段合成完（约 50 毫秒/字，200 字约 10 秒）。
-            </small>
+            <label for="mimo_relay_endpoint">中转地址（必填，由服务器发起请求）：</label>
+            <input id="mimo_relay_endpoint" type="text" class="text_pole" maxlength="500" placeholder="例如 http://127.0.0.1:8000/v1/audio/speech"/>
 
-            <label for="mimo_chunk_seconds">攒包阈值（秒，仅"分块流式"有效）：</label>
-            <input id="mimo_chunk_seconds" type="number" class="text_pole" min="1" max="60" step="1"/>
+            <label for="mimo_api_key">API Key（可选，随中转请求发送）：</label>
+            <input id="mimo_api_key" type="password" class="text_pole" maxlength="200" placeholder="sk-..." autocomplete="off"/>
+
+            <label for="mimo_model">模型：</label>
+            <input id="mimo_model" type="text" class="text_pole" maxlength="100"/>
+
+            <label for="mimo_voices">音色列表（逗号分隔）：</label>
+            <input id="mimo_voices" type="text" class="text_pole" maxlength="500"/>
+
+            <label for="mimo_style">风格指令（可留空）：</label>
+            <input id="mimo_style" type="text" class="text_pole" maxlength="500" placeholder="例如：用轻快上扬的语调，语速稍快"/>
+
+            <hr>
 
             <label class="checkbox_label">
                 <input type="checkbox" id="mimo_pipeline"/>
@@ -206,43 +138,12 @@ export class MiMoTtsProvider {
                 <input id="mimo_pipeline_max" type="number" class="text_pole" min="20" max="500" step="10"/>
             </div>
 
-            <hr>
-
-            <label for="mimo_mode">传输方式：</label>
-            <select id="mimo_mode" class="text_pole">
-                <option value="direct">直连（浏览器 → 新加坡）</option>
-                <option value="relay">经服务器中转（备用）</option>
-            </select>
-
-            <label for="mimo_api_key">API Key（直连模式用）：</label>
-            <input id="mimo_api_key" type="password" class="text_pole" maxlength="200" placeholder="sk-..." autocomplete="off"/>
-
-            <label for="mimo_model">模型：</label>
-            <input id="mimo_model" type="text" class="text_pole" maxlength="100"/>
-
-            <label for="mimo_voices">音色列表（逗号分隔）：</label>
-            <input id="mimo_voices" type="text" class="text_pole" maxlength="500"/>
-
-            <label for="mimo_style">风格指令（可留空）：</label>
-            <input id="mimo_style" type="text" class="text_pole" maxlength="500" placeholder="例如：用轻快上扬的语调，语速稍快"/>
-
-            <label for="mimo_relay_endpoint">中转地址（中转模式用，由服务器发起请求）：</label>
-            <input id="mimo_relay_endpoint" type="text" class="text_pole" maxlength="500" placeholder="留空 = 不启用中转；例如 http://你的中转服务:端口/v1/audio/speech"/>
-
             <small class="mimo-hint">
-                直连走你的浏览器 → 新加坡，服务器完全不参与；若直连不可用，把"传输方式"改成"经服务器中转"即可。<br>
+                所有合成请求都由酒馆服务器转发到上面的「中转地址」，浏览器不再直连供应商。<br>
                 音色与角色映射沿用酒馆的 Voice Map，无需在此重复设置。
             </small>
             <div id="mimo_save_state" class="mimo-save-state" style="margin-top:6px;font-size:12px;opacity:.65"></div>
         </div>`;
-    }
-
-    constructor() {
-        this.handler = async function (/** @type {string} */ key) {
-            if (key !== 'api_key_custom_openai_tts') {
-                return;
-            }
-        }.bind(this);
     }
 
     dispose() {
@@ -258,7 +159,7 @@ export class MiMoTtsProvider {
             if (key in this.defaultSettings && key !== 'voiceMap') {
                 this.settings[key] = settings[key];
             } else if (!(key in this.defaultSettings)) {
-                console.warn(`[MiMo TTS] 忽略未知设置项: ${key}`);
+                console.warn(`[TTS Enhancement] 忽略未知设置项: ${key}`);
             }
         }
 
@@ -266,12 +167,9 @@ export class MiMoTtsProvider {
             this.settings.voices = [...this.defaultSettings.voices];
         }
 
-        $('#mimo_play_mode').val(this.settings.play_mode);
-        $('#mimo_chunk_seconds').val(this.settings.chunk_seconds);
         $('#mimo_pipeline').prop('checked', !!this.settings.pipeline);
         $('#mimo_pipeline_first').val(this.settings.pipeline_first);
         $('#mimo_pipeline_max').val(this.settings.pipeline_max);
-        $('#mimo_mode').val(this.settings.mode);
         $('#mimo_api_key').val(this.settings.api_key);
         $('#mimo_model').val(this.settings.model);
         $('#mimo_voices').val(this.settings.voices.join(','));
@@ -282,12 +180,9 @@ export class MiMoTtsProvider {
             $(selector).off('input change').on('input change', handler);
         };
 
-        bind('#mimo_play_mode', () => this.onSettingsChange());
-        bind('#mimo_chunk_seconds', () => this.onSettingsChange());
         bind('#mimo_pipeline', () => this.onSettingsChange());
         bind('#mimo_pipeline_first', () => this.onSettingsChange());
         bind('#mimo_pipeline_max', () => this.onSettingsChange());
-        bind('#mimo_mode', () => this.onSettingsChange());
         bind('#mimo_api_key', () => this.onSettingsChange());
         bind('#mimo_model', () => this.onSettingsChange());
         bind('#mimo_voices', () => this.onSettingsChange());
@@ -296,19 +191,15 @@ export class MiMoTtsProvider {
 
         await this.checkReady();
 
-        console.info(`[MiMo TTS] v${VERSION} 设置已加载：${this.settings.mode} / ${this.settings.play_mode}`);
+        console.info(`[${PROVIDER_NAME}] v${VERSION} 设置已加载`);
     }
 
     onSettingsChange() {
-        this.settings.play_mode = String($('#mimo_play_mode').val() || 'whole');
-        const chunkSeconds = Number($('#mimo_chunk_seconds').val());
-        this.settings.chunk_seconds = Number.isFinite(chunkSeconds) ? Math.min(60, Math.max(1, chunkSeconds)) : 8;
         this.settings.pipeline = !!$('#mimo_pipeline').prop('checked');
         const pf = Number($('#mimo_pipeline_first').val());
         this.settings.pipeline_first = Number.isFinite(pf) ? Math.min(200, Math.max(5, pf)) : 20;
         const pm = Number($('#mimo_pipeline_max').val());
         this.settings.pipeline_max = Number.isFinite(pm) ? Math.min(500, Math.max(20, pm)) : 120;
-        this.settings.mode = String($('#mimo_mode').val() || 'direct');
         this.settings.api_key = String($('#mimo_api_key').val() || '');
         this.settings.model = String($('#mimo_model').val() || MODEL_PRESET);
         this.settings.voices = String($('#mimo_voices').val() || '')
@@ -371,9 +262,9 @@ export class MiMoTtsProvider {
     generateTts(text, voiceId) {
         // 【防护】白名单式正则可能把「整条都是元数据块」的消息删空
         // （例如整条只有 <phone_module> 或 <chat_history>），
-        // 而 MiMo 对空内容会返回 HTTP 500 —— 这里提前拦下，别把 500 抛给用户。
+        // 而中转接口对空内容会返回 HTTP 500 —— 这里提前拦下，别把 500 抛给用户。
         if (!hasSpeakableText(text)) {
-            console.info('[MiMo TTS] 这条消息清洗后没有可朗读的文字（可能整条都是元数据块），已跳过。清洗后内容:', JSON.stringify(text));
+            console.info(`[${PROVIDER_NAME}] 这条消息清洗后没有可朗读的文字（可能整条都是元数据块），已跳过。清洗后内容:`, JSON.stringify(text));
             toast('info', '这条消息没有可朗读的文字（内容都是元数据块）');
             return (async function* () {})();
         }
@@ -382,15 +273,12 @@ export class MiMoTtsProvider {
         // 新请求覆盖旧请求：中止上一个仍在途的生成
         const signal = beginGeneration();
 
-        if (this.settings.play_mode === 'chunked' && this.settings.mode === 'direct') {
-            return this.chunkedTts(text, resolved, signal);
-        }
         return this.wholeTts(text, resolved, signal);
     }
 
     /**
      * 把长文本切成适合流水线的批次。
-     * 首批小（首音快），之后按几何增长到上限——因为 MiMo 的生成速度约为播放速度的
+     * 首批小（首音快），之后按几何增长到上限——因为供应商的生成速度约为播放速度的
      * 2.5 倍（实测约 54ms/字 vs 约 135ms/字），只要下一批不超上一批的 ~2.5 倍，
      * 播放就不会"断粮"（断供）。
      */
@@ -428,12 +316,12 @@ export class MiMoTtsProvider {
 
         for (let i = 0; i < chunks.length; i++) {
             if (signal?.aborted) {
-                console.info('[MiMo TTS] 生成已取消（用户切换了消息或停止了播放）');
+                console.info('[TTS Enhancement] 生成已取消（用户切换了消息或停止了播放）');
                 return;
             }
 
             if (!hasSpeakableText(chunks[i])) {
-                console.info(`[MiMo TTS] 第 ${i + 1} 批没有可朗读的内容，跳过`);
+                console.info(`[TTS Enhancement] 第 ${i + 1} 批没有可朗读的内容，跳过`);
                 continue;
             }
 
@@ -443,13 +331,13 @@ export class MiMoTtsProvider {
                 ({ bytes, contentType } = await this.fetchWholeBytes(chunks[i], voiceId, signal));
             } catch (error) {
                 if (signal?.aborted || isAbortError(error)) {
-                    console.info('[MiMo TTS] 生成已取消（用户切换了消息或停止了播放）');
+                    console.info('[TTS Enhancement] 生成已取消（用户切换了消息或停止了播放）');
                     return;
                 }
                 if (i === 0) {
                     throw error; // 首批失败：直接把错误暴露给用户
                 }
-                console.warn(`[MiMo TTS] 第 ${i + 1} 批失败，跳过该批：`, error);
+                console.warn(`[TTS Enhancement] 第 ${i + 1} 批失败，跳过该批：`, error);
                 continue;
             }
 
@@ -462,234 +350,45 @@ export class MiMoTtsProvider {
 
     /**
      * 拿一整段音频，返回原始字节 + MIME。
-     * 直连走非流式接口（单个完整 MP3，仅含 1 个 Xing 头帧，音频干净）；
-     * 中转走酒馆转发的 5002 代理。
+     * 固定经酒馆服务器中转：由服务器请求 provider_endpoint（OpenAI 兼容的
+     * /v1/audio/speech），并把 API Key 一并转发。
      */
     async fetchWholeBytes(text, voiceId, signal) {
-        if (this.settings.mode === 'relay') {
-            const endpoint = String(this.settings.relay_endpoint || '').trim();
-            if (!endpoint) {
-                throw new Error('已选择"经服务器中转"，但中转地址是空的。请在 MiMo 设置里填写中转地址，或改回直连。');
-            }
-            const response = await fetch(ST_RELAY_ROUTE, {
-                method: 'POST',
-                headers: getRequestHeaders(),
-                signal,
-                body: JSON.stringify({
-                    provider_endpoint: endpoint,
-                    model: this.settings.model,
-                    input: text,
-                    voice: voiceId,
-                    response_format: 'mp3',
-                    speed: 1,
-                }),
-            });
-            if (!response.ok) {
-                throw new Error(`中转失败 HTTP ${response.status}: ${await response.text()}`);
-            }
-            const buf = await response.arrayBuffer();
-            if (buf.byteLength === 0) {
-                throw new Error('中转返回了空音频，请检查服务器上的代理是否在运行');
-            }
-            return {
-                bytes: new Uint8Array(buf),
-                contentType: response.headers.get('Content-Type') || 'audio/mpeg',
-            };
+        const endpoint = String(this.settings.relay_endpoint || '').trim();
+        if (!endpoint) {
+            throw new Error('中转地址是空的。请在供应商设置里填写中转地址（例如 http://127.0.0.1:8000/v1/audio/speech）。');
         }
 
-        let response = await this.postDirect(text, voiceId, false, 'mp3', signal);
-        if (!response.ok && response.status >= 500) {
-            // MiMo 服务端偶发 5xx（实测同一段文本可能一次 500、一次成功），自动重试一次
-            console.warn(`[MiMo TTS] 服务端返回 ${response.status}，1 秒后重试一次`);
-            await new Promise(r => setTimeout(r, 1000));
-            response = await this.postDirect(text, voiceId, false, 'mp3', signal);
-        }
-        if (!response.ok) {
-            const detail = await response.text();
-            throw new Error(
-                response.status >= 500
-                    ? `MiMo 服务端错误 ${response.status}（通常是 MiMo 那边的临时故障，稍后重试即可）。原始信息：${detail}`
-                    : `MiMo HTTP ${response.status}: ${detail}`,
-            );
-        }
-        const json = await response.json();
-        const b64 = json?.choices?.[0]?.message?.audio?.data;
-        if (!b64) {
-            const detail = json?.base_resp?.status_msg || json?.error?.message || '返回体里没有音频数据';
-            throw new Error(`MiMo 未返回音频：${detail}`);
-        }
-        const bytes = base64ToBytes(b64);
-        if (bytes.length === 0) {
-            throw new Error('MiMo 返回的音频数据为空，请检查模型名与音色是否正确');
-        }
-        return { bytes, contentType: 'audio/mpeg' };
-    }
-
-    /**
-     * 分块流式：用 pcm16 传输（无帧结构，可安全切割）并自行封装 WAV，
-     * 以避开 MiMo 流式块自带的 Xing 头帧造成的杂音。
-     * 注意：块与块之间仍会有 0.3~0.5 秒间断，这是酒馆播放器决定的。
-     */
-    async *chunkedTts(text, voiceId, signal) {
-        let response;
-        try {
-            response = await this.postDirect(text, voiceId, true, 'pcm16', signal);
-        } catch (error) {
-            if (signal?.aborted || isAbortError(error)) {
-                console.info('[MiMo TTS] 生成已取消（用户切换了消息或停止了播放）');
-                return;
-            }
-            throw error;
-        }
-        if (!response.ok) {
-            throw new Error(`MiMo HTTP ${response.status}: ${await response.text()}`);
-        }
-
-        const threshold = Math.max(48000, Number(this.settings.chunk_seconds || 8) * BYTES_PER_SECOND);
-        let pending = [];
-        let pendingBytes = 0;
-
-        try {
-            for await (const bytes of this.readSseAudio(response)) {
-                pending.push(bytes);
-                pendingBytes += bytes.length;
-                if (pendingBytes >= threshold) {
-                    const wav = this.takeWavChunk(pending);
-                    pending = [];
-                    pendingBytes = 0;
-                    yield wav;
-                }
-            }
-        } catch (error) {
-            if (signal?.aborted || isAbortError(error)) {
-                console.info('[MiMo TTS] 生成已取消（用户切换了消息或停止了播放）');
-                return;
-            }
-            throw error;
-        }
-
-        if (pendingBytes > 0) {
-            yield this.takeWavChunk(pending);
-        }
-    }
-
-    takeWavChunk(parts) {
-        let pcm = concatBytes(parts);
-        // 保证 16bit 采样对齐
-        if (pcm.length % 2 !== 0) {
-            pcm = pcm.subarray(0, pcm.length - 1);
-        }
-        const wav = pcm16ToWav(pcm);
-        return new Response(wav, {
-            status: 200,
-            headers: { 'Content-Type': 'audio/wav', 'Content-Length': String(wav.length) },
-        });
-    }
-
-    /**
-     * 解析 MiMo 的 SSE 流，逐段吐出原始音频字节。
-     * 注意：网络分片可能把一行切断，所以要留残余缓冲。
-     */
-    async *readSseAudio(response) {
-        if (!response.body) {
-            throw new Error('当前环境不支持流式读取（response.body 为空）');
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder('utf-8');
-        let lineBuffer = '';
-
-        try {
-            for (;;) {
-                const { done, value } = await reader.read();
-                if (done) {
-                    break;
-                }
-                lineBuffer += decoder.decode(value, { stream: true });
-
-                let nl;
-                while ((nl = lineBuffer.indexOf('\n')) !== -1) {
-                    const line = lineBuffer.slice(0, nl).replace(/\r$/, '');
-                    lineBuffer = lineBuffer.slice(nl + 1);
-
-                    if (!line.startsWith('data:')) {
-                        continue;
-                    }
-                    const payload = line.slice(5).trim();
-                    if (!payload || payload === '[DONE]') {
-                        continue;
-                    }
-
-                    let json;
-                    try {
-                        json = JSON.parse(payload);
-                    } catch {
-                        continue;
-                    }
-
-                    const b64 = json?.choices?.[0]?.delta?.audio?.data;
-                    if (!b64) {
-                        continue;
-                    }
-                    const bytes = base64ToBytes(b64);
-                    if (bytes.length > 0) {
-                        yield bytes;
-                    }
-                }
-            }
-        } finally {
-            try {
-                reader.releaseLock();
-            } catch {
-                /* ignore */
-            }
-        }
-    }
-
-    /** 直连请求（预置音色 / 分块流式） */
-    postDirect(text, voiceId, stream, format, signal) {
-        const style = String(this.settings.style || '').trim();
         const payload = {
-            model: this.settings.model || MODEL_PRESET,
-            messages: [
-                { role: 'user', content: style },
-                { role: 'assistant', content: text },
-            ],
-            audio: { format: format || 'mp3', voice: voiceId },
+            provider_endpoint: endpoint,
+            model: this.settings.model,
+            input: text,
+            voice: voiceId,
+            response_format: 'mp3',
+            speed: 1,
         };
-        if (stream) {
-            payload.stream = true;
-        }
-        return this.postJson(payload, signal);
-    }
-
-    /** 统一发请求：带 api-key，并把浏览器那句没用的 "Failed to fetch" 翻译成人话 */
-    postJson(payload, signal) {
         const key = String(this.settings.api_key || '').trim();
-        if (!key) {
-            throw new Error('请先在 MiMo 供应商设置里填写 API Key');
+        if (key) {
+            payload.api_key = key;
         }
 
-        return fetch(MIMO_ENDPOINT, {
+        const response = await fetch(ST_RELAY_ROUTE, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'api-key': key,
-            },
+            headers: getRequestHeaders(),
             signal,
             body: JSON.stringify(payload),
-        }).catch(error => {
-            if (isAbortError(error)) {
-                throw error;
-            }
-            // 浏览器只会给一个笼统的 "TypeError: Failed to fetch"，
-            // 换成能看懂的说明（网络中断 / 被拦截 / 跨域被拒）
-            throw new Error(
-                '无法连接 MiMo 接口（网络中断、被广告拦截器或代理拦下，或跨域被拒）。'
-                + '请检查网络后重试；若开着 VPN / 广告拦截，先关掉再试。原始信息：'
-                + (error?.message || error),
-            );
         });
+        if (!response.ok) {
+            throw new Error(`中转失败 HTTP ${response.status}: ${await response.text()}`);
+        }
+        const buf = await response.arrayBuffer();
+        if (buf.byteLength === 0) {
+            throw new Error('中转返回了空音频，请检查服务器上的代理是否在运行');
+        }
+        return {
+            bytes: new Uint8Array(buf),
+            contentType: response.headers.get('Content-Type') || 'audio/mpeg',
+        };
     }
 
     async previewTtsVoice(voiceId) {
@@ -707,7 +406,7 @@ export class MiMoTtsProvider {
 }
 
 // ----------------------------------------------------------------------
-//  注册供应商（下拉框里多一项 MiMo）
+//  注册供应商（下拉框里多一项 OpenAI Compatible Enhancement）
 // ----------------------------------------------------------------------
 
 let registered = false;
@@ -743,9 +442,9 @@ function register() {
     try {
         registerTtsProvider(PROVIDER_NAME, MiMoTtsProvider);
         registered = true;
-        console.info(`[MiMo TTS] v${VERSION} 供应商已注册`);
+        console.info(`[TTS Enhancement] v${VERSION} 供应商已注册`);
     } catch (error) {
-        console.warn('[MiMo TTS] 注册失败（可能已注册）', error);
+        console.warn('[TTS Enhancement] 注册失败（可能已注册）', error);
     }
 }
 
