@@ -14,11 +14,19 @@
 import { getRequestHeaders, eventSource, event_types } from '../../../../script.js';
 import { registerTtsProvider, saveTtsProviderSettings } from '../../tts/index.js';
 
-const VERSION = '2.0.1';
+const VERSION = '2.0.2';
 const PROVIDER_NAME = 'OpenAI Compatible Enhancement';
 const ST_RELAY_ROUTE = '/api/openai/custom/generate-voice';
-const MODEL_PRESET = 'mimo-v2.5-tts';
-const PREVIEW_TEXT = '你好，我是语音合成，这是一段试听。';
+const MODEL_PRESET = 'tts-1';
+const PREVIEW_TEXT = '你好，我是语音合成模型，这是一段试听。';
+
+// 段落分隔标记：酒馆在调用 generateTts 前会执行 text.replace(/\s+/g, ' ')，换行活不到
+// 切分阶段。processText 在折叠之前把段落边界换成这个私用区字符，保留到 splitIntoChunks。
+const PARAGRAPH_MARK = '\uE000';
+
+let paragraphFallbackWarned = false;
+let filterConflictWarned = false;
+let filterInvalidWarned = false;
 
 // ----------------------------------------------------------------------
 //  在途请求的取消（重要）
@@ -47,6 +55,63 @@ function hasSpeakableText(text) {
     }
     // 去掉所有空白 / 标点 / 符号后还剩东西，才算可朗读
     return s.replace(/[\s\p{P}\p{S}]/gu, '').length > 0;
+}
+
+/**
+ * 按段落切分原文：优先用连续两个换行符（中间允许空格），没有则退化为单个换行符。
+ * 都找不到可用边界时返回 null，由调用方回退到默认的按句切分。
+ */
+function splitIntoParagraphs(text) {
+    const s = String(text ?? '');
+    let parts;
+    if (/\n[^\S\n]*\n/.test(s)) {
+        parts = s.split(/\n[^\S\n]*\n+/);
+    } else if (s.includes('\n')) {
+        parts = s.split(/\n+/);
+    } else {
+        return null;
+    }
+    const trimmed = parts.map(p => p.trim()).filter(p => p.length > 0);
+    return trimmed.length > 1 ? trimmed : null;
+}
+
+/**
+ * 解析 `/pattern/flags` 或纯 pattern，行为与酒馆的 regexFromString 一致。
+ * 解析失败返回 undefined。
+ */
+function regexFromString(input) {
+    try {
+        const m = String(input).match(/(\/?)(.+)\1([a-z]*)/i);
+        if (m[3] && !/^(?!.*?(.).*?\1)[gmixXsuUAJ]+$/.test(m[3])) {
+            return RegExp(input);
+        }
+        return new RegExp(m[2], m[3]);
+    } catch {
+        return undefined;
+    }
+}
+
+/**
+ * 清洗但保留段落结构：只折叠水平空白、压掉多余空行，绝不把换行变成空格。
+ * 这是「由扩展过滤正则」能保住段落边界的关键。
+ */
+function cleanKeepingParagraphs(text) {
+    return String(text)
+        .replace(/\r\n?/g, '\n')
+        .replace(/[ \t]*\n[ \t]*/g, '\n')
+        .replace(/[ \t]+/g, ' ')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+/** 酒馆自己的「应用正则过滤」是否真的在生效（与酒馆同款判断条件） */
+function isStRegexFilterEnabled() {
+    try {
+        const tts = globalThis.SillyTavern?.getContext?.()?.extensionSettings?.tts;
+        return !!(tts?.apply_regex && tts?.regex_pattern);
+    } catch {
+        return false;
+    }
 }
 
 /** 开始一次生成：中止上一个在途请求，返回新的 signal */
@@ -94,10 +159,12 @@ export class MiMoTtsProvider {
         // 分段流水线：长文本自动按句切分、逐批请求、边到边播（首音更快）。
         // 用于替代酒馆的「按段朗读」——后者会让清洗变为逐行，跨行正则失效。
         pipeline: true,
+        pipeline_mode: 'default', // 'default' 按句切分；'paragraph' 按段切分
+        filter_regex: '',     // 由扩展过滤正则（与酒馆「应用正则过滤」互斥，保留换行）
         pipeline_first: 20,   // 首批字数（越小首音越快）
         pipeline_max: 120,    // 后续每批上限（越大卡顿越少）
         style: '',
-        voices: ['茉莉', '冰糖', '苏打', '白桦', 'Mia', 'Chloe', 'Milo', 'Dean'],
+        voices: ['A'],
         // 中转地址留空，由用户自己填（不再写死某台机器的内网地址）
         relay_endpoint: '',
     };
@@ -120,6 +187,14 @@ export class MiMoTtsProvider {
             <label for="mimo_style">风格指令（可留空）：</label>
             <input id="mimo_style" type="text" class="text_pole" maxlength="500" placeholder="例如：用轻快上扬的语调，语速稍快"/>
 
+            <label for="mimo_filter_regex">由扩展过滤正则（与酒馆「应用正则过滤」互斥）：</label>
+            <textarea id="mimo_filter_regex" class="text_pole" rows="3" maxlength="2000"
+                placeholder="例如：/&lt;tag&gt;[\\s\\S]*?&lt;\/tag&gt;/gs"></textarea>
+            <small>
+                填写后请把酒馆 TTS 面板的「应用正则过滤」<b>关掉</b>：那一步会把空白折叠成空格，
+                段落边界会因此丢失。本扩展只删除命中内容，<b>保留换行</b>。
+            </small>
+
             <hr>
 
             <label class="checkbox_label">
@@ -132,7 +207,17 @@ export class MiMoTtsProvider {
                 关掉后由本扩展自己把长文本按句切分、逐批请求、边到边播，首音仍只要 1~2 秒。
             </small>
 
-            <label for="mimo_pipeline_first">首批字数 / 后续每批上限：</label>
+            <label for="mimo_pipeline_mode">分段方式：</label>
+            <select id="mimo_pipeline_mode" class="text_pole">
+                <option value="default">默认（按句切分，逐批放大）</option>
+                <option value="paragraph">按段（优先空行，其次单换行）</option>
+            </select>
+            <small>
+                「按段」依赖原文换行。请关闭酒馆的「应用正则过滤」，把规则填到上面的
+                「由扩展过滤正则」，否则换行会在更早的清洗里被折叠，本条自动回退为按句切分。
+            </small>
+
+            <label for="mimo_pipeline_first">首批字数 / 后续每批上限（仅默认方式）：</label>
             <div class="flex-container alignItemsCenter flexGap5">
                 <input id="mimo_pipeline_first" type="number" class="text_pole" min="5" max="200" step="5"/>
                 <input id="mimo_pipeline_max" type="number" class="text_pole" min="20" max="500" step="10"/>
@@ -166,8 +251,16 @@ export class MiMoTtsProvider {
         if (!Array.isArray(this.settings.voices)) {
             this.settings.voices = [...this.defaultSettings.voices];
         }
+        if (this.settings.pipeline_mode !== 'paragraph') {
+            this.settings.pipeline_mode = 'default';
+        }
+        if (typeof this.settings.filter_regex !== 'string') {
+            this.settings.filter_regex = '';
+        }
 
         $('#mimo_pipeline').prop('checked', !!this.settings.pipeline);
+        $('#mimo_pipeline_mode').val(this.settings.pipeline_mode);
+        $('#mimo_filter_regex').val(this.settings.filter_regex);
         $('#mimo_pipeline_first').val(this.settings.pipeline_first);
         $('#mimo_pipeline_max').val(this.settings.pipeline_max);
         $('#mimo_api_key').val(this.settings.api_key);
@@ -181,12 +274,14 @@ export class MiMoTtsProvider {
         };
 
         bind('#mimo_pipeline', () => this.onSettingsChange());
+        bind('#mimo_pipeline_mode', () => this.onSettingsChange());
         bind('#mimo_pipeline_first', () => this.onSettingsChange());
         bind('#mimo_pipeline_max', () => this.onSettingsChange());
         bind('#mimo_api_key', () => this.onSettingsChange());
         bind('#mimo_model', () => this.onSettingsChange());
         bind('#mimo_voices', () => this.onSettingsChange());
         bind('#mimo_style', () => this.onSettingsChange());
+        bind('#mimo_filter_regex', () => this.onSettingsChange());
         bind('#mimo_relay_endpoint', () => this.onSettingsChange());
 
         await this.checkReady();
@@ -196,6 +291,7 @@ export class MiMoTtsProvider {
 
     onSettingsChange() {
         this.settings.pipeline = !!$('#mimo_pipeline').prop('checked');
+        this.settings.pipeline_mode = String($('#mimo_pipeline_mode').val() || '') === 'paragraph' ? 'paragraph' : 'default';
         const pf = Number($('#mimo_pipeline_first').val());
         this.settings.pipeline_first = Number.isFinite(pf) ? Math.min(200, Math.max(5, pf)) : 20;
         const pm = Number($('#mimo_pipeline_max').val());
@@ -207,6 +303,7 @@ export class MiMoTtsProvider {
             .map(v => v.trim())
             .filter(v => v.length > 0);
         this.settings.style = String($('#mimo_style').val() || '');
+        this.settings.filter_regex = String($('#mimo_filter_regex').val() || '');
         this.settings.relay_endpoint = String($('#mimo_relay_endpoint').val() || '').trim();
         saveTtsProviderSettings();
         this.markSaved();
@@ -259,6 +356,69 @@ export class MiMoTtsProvider {
     //  合成入口
     // ------------------------------------------------------------------
 
+    /**
+     * 酒馆在 generateTts 之前会执行 text.replace(/\s+/g, ' ')，换行到不了切分阶段。
+     * 段落模式必须在这里（折叠之前）把段落边界换成 PARAGRAPH_MARK 保留下来。
+     */
+    processText(text) {
+        // 扩展侧正则过滤：替代酒馆那步会把空白折叠成空格、从而毁掉段落边界的清洗
+        const filtered = this.applyFilter(text);
+
+        if (!this.settings?.pipeline || this.settings.pipeline_mode !== 'paragraph') {
+            return filtered;
+        }
+
+        const paragraphs = splitIntoParagraphs(filtered);
+        if (!paragraphs) {
+            if (!paragraphFallbackWarned) {
+                paragraphFallbackWarned = true;
+                console.warn(
+                    '[TTS Enhancement] 段落模式没找到可用的换行符，本条回退为按句切分。'
+                    + '注意：酒馆的「应用正则过滤」会在本步骤之前把换行压成空格。',
+                );
+                toast('warning', '段落模式没找到换行符，已回退为按句切分');
+            }
+            return filtered;
+        }
+        return paragraphs.join(PARAGRAPH_MARK);
+    }
+
+    /**
+     * 扩展自己的正则过滤：只删命中内容，保留换行。
+     * 与酒馆的「应用正则过滤」互斥——那边开着时本扩展不介入（否则会重复清洗，
+     * 而且它的空白折叠已经把段落边界毁掉了）。
+     */
+    applyFilter(text) {
+        const pattern = String(this.settings?.filter_regex || '').trim();
+        if (!pattern) {
+            return text;
+        }
+
+        if (isStRegexFilterEnabled()) {
+            if (!filterConflictWarned) {
+                filterConflictWarned = true;
+                console.warn(
+                    '[TTS Enhancement] 酒馆的「应用正则过滤」已开启，与扩展过滤互斥，本次不执行扩展过滤。'
+                    + '请关掉酒馆的，把规则填到扩展设置里。',
+                );
+                toast('warning', '酒馆的「应用正则过滤」与扩展过滤互斥，请关掉酒馆的那个');
+            }
+            return text;
+        }
+
+        const regex = regexFromString(pattern);
+        if (!regex) {
+            if (!filterInvalidWarned) {
+                filterInvalidWarned = true;
+                console.warn(`[TTS Enhancement] 过滤正则无效，已跳过：${pattern}`);
+                toast('warning', '过滤正则无效，已跳过');
+            }
+            return text;
+        }
+
+        return cleanKeepingParagraphs(String(text).replace(regex, ''));
+    }
+
     generateTts(text, voiceId) {
         // 【防护】白名单式正则可能把「整条都是元数据块」的消息删空
         // （例如整条只有 <phone_module> 或 <chat_history>），
@@ -278,14 +438,26 @@ export class MiMoTtsProvider {
 
     /**
      * 把长文本切成适合流水线的批次。
-     * 首批小（首音快），之后按几何增长到上限——因为供应商的生成速度约为播放速度的
-     * 2.5 倍（实测约 54ms/字 vs 约 135ms/字），只要下一批不超上一批的 ~2.5 倍，
-     * 播放就不会"断粮"（断供）。
+     * 段落模式：还原 processText 留下的段落标记，一段一批；
+     * 默认模式：按句切分后装箱，首批小（首音快），之后按几何增长到上限——因为供应商的
+     * 生成速度约为播放速度的 2.5 倍（实测约 54ms/字 vs 约 135ms/字），只要下一批不超
+     * 上一批的 ~2.5 倍，播放就不会"断粮"（断供）。
      */
     splitIntoChunks(text) {
+        const source = String(text);
+        if (this.settings.pipeline_mode === 'paragraph' && source.includes(PARAGRAPH_MARK)) {
+            const paragraphs = source
+                .split(PARAGRAPH_MARK)
+                .map(p => p.trim())
+                .filter(p => p.length > 0);
+            if (paragraphs.length > 0) {
+                return paragraphs;
+            }
+        }
+
         const first = Math.max(5, Number(this.settings.pipeline_first) || 20);
         const max = Math.max(first, Number(this.settings.pipeline_max) || 120);
-        const sentences = String(text).match(/[^。！？!?…；;\n]+[。！？!?…；;]*/g) || [String(text)];
+        const sentences = source.match(/[^。！？!?…；;\n]+[。！？!?…；;]*/g) || [source];
 
         const chunks = [];
         let cur = '';
