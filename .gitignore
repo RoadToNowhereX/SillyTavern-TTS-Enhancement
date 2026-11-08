@@ -1,0 +1,18 @@
+# 依赖
+node_modules/
+
+# 日志
+*.log
+
+# 环境变量与本地密钥
+.env
+.env.*
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+.trae/
+
+# 操作系统
+.DS_Store
+Thumbs.db
