@@ -17,6 +17,9 @@ import { registerTtsProvider, saveTtsProviderSettings } from '../../tts/index.js
 const VERSION = '2.0.4';
 const PROVIDER_NAME = 'OpenAI Compatible Enhancement';
 const ST_RELAY_ROUTE = '/api/openai/custom/generate-voice';
+// 酒馆自带的「自定义 OpenAI 兼容 API」状态检查路由：服务器侧 GET <custom_url>/models。
+// 用它来绕过浏览器跨域限制（本扩展不能修改酒馆的服务端代码）。
+const ST_MODELS_RELAY_ROUTE = '/api/backends/chat-completions/status';
 const MODEL_PRESET = 'tts-1';
 const PREVIEW_TEXT = '你好，我是语音合成模型，这是一段试听。';
 
@@ -151,6 +154,34 @@ function extractModelIds(payload) {
         }
     }
     return ids.sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * 经酒馆服务器中转拉取模型列表（浏览器直连被 CORS 拦截时的兜底）。
+ * 借用酒馆的 chat-completions/status 路由：它会在服务器侧 GET <custom_url>/models。
+ * 用 custom_include_headers 覆盖 Authorization，避免把酒馆里存的 Custom API Key
+ * 发给 TTS 供应商；这里只发送本扩展自己的 Key（没有则发送空值）。
+ */
+async function fetchModelIdsViaServer(modelsUrl, apiKey) {
+    const baseUrl = modelsUrl.replace(/\/models$/i, '');
+    const authValue = apiKey ? `Bearer ${apiKey}` : '';
+    const response = await fetch(ST_MODELS_RELAY_ROUTE, {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({
+            chat_completion_source: 'custom',
+            custom_url: baseUrl,
+            custom_include_headers: `Authorization: ${JSON.stringify(authValue)}`,
+        }),
+    });
+    if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+    }
+    const ids = extractModelIds(await response.json());
+    if (ids.length === 0) {
+        throw new Error('响应里没有模型 ID');
+    }
+    return ids;
 }
 
 /**
@@ -509,7 +540,7 @@ export class MiMoTtsProvider {
     /**
      * 请求供应商的 /v1/models 拉取模型 ID。
      * 地址由「中转地址」推导（.../v1/audio/speech → .../v1/models），失败再试 /models。
-     * 浏览器直连供应商，若被跨域策略拦截，提示用户手动填写模型。
+     * 浏览器直连失败（典型是 CORS 的 Failed to fetch）时，自动改由酒馆服务器中转。
      */
     async fetchModelList() {
         const endpoints = deriveModelEndpoints(this.settings.relay_endpoint);
@@ -530,7 +561,9 @@ export class MiMoTtsProvider {
         this.setModelStatus('正在获取模型列表…');
 
         const failures = [];
+        const networkFailures = [];
         try {
+            // 第一轮：浏览器直连（成功就不必经过酒馆服务器）
             for (const url of endpoints) {
                 try {
                     const response = await fetch(url, { method: 'GET', headers });
@@ -543,25 +576,43 @@ export class MiMoTtsProvider {
                         failures.push(`${url} → 响应里没有模型 ID`);
                         continue;
                     }
-                    this.settings.model_list = ids;
-                    this.renderModelList();
-                    this.setModelStatus(`已获取 ${ids.length} 个模型：${url}`);
-                    toast('success', `已获取 ${ids.length} 个模型`);
-                    saveTtsProviderSettings();
-                    this.markSaved();
+                    this.applyModelList(ids, url);
                     return;
                 } catch (error) {
                     failures.push(`${url} → ${error?.message || error}`);
+                    networkFailures.push(url);
                 }
             }
+
+            // 第二轮：直连报 Failed to fetch（典型是 CORS），改由酒馆服务器请求
+            for (const url of networkFailures) {
+                try {
+                    const ids = await fetchModelIdsViaServer(url, key);
+                    this.applyModelList(ids, `${url}（经酒馆服务器中转）`);
+                    return;
+                } catch (error) {
+                    failures.push(`${url}（经酒馆中转）→ ${error?.message || error}`);
+                }
+            }
+
             this.setModelStatus(
-                `获取失败：${failures.join('；')}。若为浏览器跨域限制，可直接在「模型」文本框手动输入。`,
+                `获取失败：${failures.join('；')}。可稍后重试，或直接在「模型」文本框手动输入。`,
                 true,
             );
             toast('warning', '获取模型列表失败，详见设置面板提示');
         } finally {
             button?.classList.remove('disabled');
         }
+    }
+
+    /** 拉取成功后统一落地：缓存、重建下拉框、保存设置、提示 */
+    applyModelList(ids, source) {
+        this.settings.model_list = ids;
+        this.renderModelList();
+        this.setModelStatus(`已获取 ${ids.length} 个模型：${source}`);
+        toast('success', `已获取 ${ids.length} 个模型`);
+        saveTtsProviderSettings();
+        this.markSaved();
     }
 
     async checkReady() {

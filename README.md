@@ -62,6 +62,7 @@ git clone https://github.com/ymf2317-tech/SillyTavern-MiMoTTS.git mimo-tts
 
 ### v2.0.4
 - ✨ 新增「获取模型列表」：按中转地址推导 `/v1/models`（失败回退 `/models`）拉取模型 ID，下拉选中后自动填入模型文本框
+- 🔀 浏览器直连被 CORS 拦截（`Failed to fetch`）时，自动改用酒馆服务器中转请求
 - 💾 模型列表缓存在供应商设置里，刷新页面后下拉框仍可用
 
 ### v2.0.0
