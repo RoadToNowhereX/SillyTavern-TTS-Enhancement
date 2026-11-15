@@ -14,7 +14,7 @@
 import { getRequestHeaders, eventSource, event_types } from '../../../../script.js';
 import { registerTtsProvider, saveTtsProviderSettings } from '../../tts/index.js';
 
-const VERSION = '2.0.4';
+const VERSION = '2.0.5';
 const PROVIDER_NAME = 'OpenAI Compatible Enhancement';
 const ST_RELAY_ROUTE = '/api/openai/custom/generate-voice';
 // 酒馆自带的「自定义 OpenAI 兼容 API」状态检查路由：服务器侧 GET <custom_url>/models。
@@ -134,6 +134,57 @@ function deriveModelEndpoints(endpoint) {
         push(`${path}/models`);
     }
     return candidates;
+}
+
+/**
+ * 由「中转地址」推导出音色列表地址（audio.cpp: /v1/audio/voices）。
+ * 典型：http://host:5002/v1/audio/speech → http://host:5002/v1/audio/voices
+ * 兜底再试不带 /v1 前缀的 /audio/voices。
+ */
+function deriveVoiceEndpoints(endpoint) {
+    const raw = String(endpoint ?? '').trim();
+    if (!raw) {
+        return [];
+    }
+    let url;
+    try {
+        url = new URL(raw);
+    } catch {
+        return [];
+    }
+    url.search = '';
+    url.hash = '';
+
+    const path = url.pathname.replace(/\/+$/, '');
+    let basePath;
+    if (/\/audio\/speech$/i.test(path)) {
+        basePath = path.replace(/\/audio\/speech$/i, '');
+    } else if (/\/v1$/i.test(path)) {
+        basePath = path;
+    } else if (path === '') {
+        basePath = '/v1';
+    } else {
+        basePath = `${path}/v1`;
+    }
+
+    const candidates = [];
+    const push = candidatePath => {
+        const full = `${url.origin}${candidatePath}`;
+        if (!candidates.includes(full)) {
+            candidates.push(full);
+        }
+    };
+    push(`${basePath}/audio/voices`);
+    push(`${basePath.replace(/\/v1$/i, '')}/audio/voices`);
+    return candidates;
+}
+
+/** 从各家 /audio/voices 响应里捞出音色 ID（audio.cpp 是 { voices: [...] }） */
+function extractVoiceIds(payload) {
+    if (Array.isArray(payload?.voices)) {
+        return extractModelIds(payload.voices);
+    }
+    return extractModelIds(payload);
 }
 
 /** 从各家 /models 响应里尽量捞出模型 ID（OpenAI 风格 / 裸数组 / { models: [...] }） */
@@ -293,7 +344,15 @@ export class MiMoTtsProvider {
             <small id="mimo_model_status"></small>
 
             <label for="mimo_voices">音色列表（逗号分隔）：</label>
-            <input id="mimo_voices" type="text" class="text_pole" maxlength="500"/>
+            <div class="flex-container alignItemsCenter flexGap5">
+                <input id="mimo_voices" type="text" class="text_pole flex1" maxlength="500"/>
+                <div id="mimo_fetch_voices" class="menu_button menu_button_icon"
+                    title="请求 /v1/audio/voices 获取音色 ID">
+                    <i class="fa-solid fa-rotate"></i>
+                    <span>获取音色列表</span>
+                </div>
+            </div>
+            <small id="mimo_voices_status"></small>
 
             <label for="mimo_style">风格指令（可留空）：</label>
             <input id="mimo_style" type="text" class="text_pole" maxlength="500" placeholder="例如：用轻快上扬的语调，语速稍快"/>
@@ -421,6 +480,7 @@ export class MiMoTtsProvider {
         bind('#mimo_model', () => this.onSettingsChange());
         bind('#mimo_model_list', () => this.onModelSelectChange());
         $('#mimo_fetch_models').off('click').on('click', () => this.fetchModelList());
+        $('#mimo_fetch_voices').off('click').on('click', () => this.fetchVoiceList());
         bind('#mimo_voices', () => this.onSettingsChange());
         bind('#mimo_style', () => this.onSettingsChange());
         bind('#mimo_filter_regex', () => this.onSettingsChange());
@@ -613,6 +673,71 @@ export class MiMoTtsProvider {
         toast('success', `已获取 ${ids.length} 个模型`);
         saveTtsProviderSettings();
         this.markSaved();
+    }
+
+    setVoicesStatus(message, isError = false) {
+        const el = document.getElementById('mimo_voices_status');
+        if (!el) {
+            return;
+        }
+        el.textContent = message;
+        el.style.color = isError ? '#e57373' : '';
+    }
+
+    /**
+     * 请求供应商的 /v1/audio/voices 拉取音色 ID，并填进「音色列表」输入框。
+     * 地址由「中转地址」推导（.../v1/audio/speech → .../v1/audio/voices）。
+     * 浏览器直连，供应商需允许跨域（audio.cpp 以 --cors-origins "*" 启动）。
+     */
+    async fetchVoiceList() {
+        const endpoints = deriveVoiceEndpoints(this.settings.relay_endpoint);
+        if (endpoints.length === 0) {
+            this.setVoicesStatus('请先填写有效的中转地址（例如 http://127.0.0.1:5002/v1/audio/speech）', true);
+            toast('warning', '请先填写有效的中转地址');
+            return;
+        }
+
+        const key = String(this.settings.api_key || '').trim();
+        const headers = { Accept: 'application/json' };
+        if (key) {
+            headers.Authorization = `Bearer ${key}`;
+        }
+
+        const button = document.getElementById('mimo_fetch_voices');
+        button?.classList.add('disabled');
+        this.setVoicesStatus('正在获取音色列表…');
+
+        const failures = [];
+        try {
+            for (const url of endpoints) {
+                try {
+                    const response = await fetch(url, { method: 'GET', headers });
+                    if (!response.ok) {
+                        failures.push(`${url} → HTTP ${response.status}`);
+                        continue;
+                    }
+                    const ids = extractVoiceIds(await response.json());
+                    if (ids.length === 0) {
+                        failures.push(`${url} → 响应里没有音色 ID`);
+                        continue;
+                    }
+                    $('#mimo_voices').val(ids.join(','));
+                    this.onSettingsChange();
+                    this.setVoicesStatus(`已获取 ${ids.length} 个音色：${url}`);
+                    toast('success', `已获取 ${ids.length} 个音色`);
+                    return;
+                } catch (error) {
+                    failures.push(`${url} → ${error?.message || error}`);
+                }
+            }
+            this.setVoicesStatus(
+                `获取失败：${failures.join('；')}。若为浏览器跨域限制，请以 --cors-origins "*" 启动 audio.cpp。`,
+                true,
+            );
+            toast('warning', '获取音色列表失败，详见设置面板提示');
+        } finally {
+            button?.classList.remove('disabled');
+        }
     }
 
     async checkReady() {
